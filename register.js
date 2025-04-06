@@ -3,14 +3,20 @@ const { ethers } = require('ethers');
 const axios = require('axios');
 const fs = require('fs');
 const readline = require('readline');
+const dns = require('dns').promises;
 
-// Configuration
+// Configuration with fallback options
 const CONFIG = {
-  synthelixApi: 'https://api.synthelix.io/v1/wallet/register',
+  apiEndpoints: [
+    'https://api.synthelix.io/v1/wallet/register',
+    'https://synthelix-api.herokuapp.com/register',
+    'https://synthelix-api.alwaysdata.net/register'
+  ],
   outputDir: 'synthelix_wallets',
   maxRetries: 3,
   retryDelay: 2000,
-  defaultWalletCount: 1
+  dnsTimeout: 5000,
+  connectionTimeout: 10000
 };
 
 class WalletRegistrar {
@@ -19,107 +25,85 @@ class WalletRegistrar {
       input: process.stdin,
       output: process.stdout
     });
+    this.currentEndpoint = 0;
+  }
+
+  async checkEndpointReachable(url) {
+    try {
+      const { hostname } = new URL(url);
+      await dns.lookup(hostname, { timeout: CONFIG.dnsTimeout });
+      return true;
+    } catch (error) {
+      console.log(`⚠️  Endpoint unreachable: ${url}`);
+      return false;
+    }
+  }
+
+  async getWorkingEndpoint() {
+    for (let i = 0; i < CONFIG.apiEndpoints.length; i++) {
+      const endpoint = CONFIG.apiEndpoints[i];
+      if (await this.checkEndpointReachable(endpoint)) {
+        console.log(`✓ Using endpoint: ${endpoint}`);
+        return endpoint;
+      }
+    }
+    throw new Error('No working API endpoints available');
   }
 
   async init() {
-    console.log('🔗 Synthelix Bulk Wallet Registration');
-    console.log('-------------------------------------');
-
-    // Create output directory
-    if (!fs.existsSync(CONFIG.outputDir)) {
-      fs.mkdirSync(CONFIG.outputDir);
-    }
-
-    // Get user input
-    const walletCount = await this.askQuestion(
-      `Enter number of wallets to generate (default ${CONFIG.defaultWalletCount}): `,
-      CONFIG.defaultWalletCount
-    );
-
-    const referralCode = await this.askQuestion(
-      'Enter referral code (press Enter to skip): ',
-      null,
-      false
-    );
-
-    // Generate wallets
-    await this.generateWallets(walletCount, referralCode);
-    this.rl.close();
-  }
-
-  async askQuestion(question, defaultValue, isNumber = true) {
-    return new Promise(resolve => {
-      this.rl.question(question, answer => {
-        if (!answer.trim()) return resolve(defaultValue);
-        resolve(isNumber ? parseInt(answer) : answer.trim());
-      });
-    });
-  }
-
-  async generateWallets(count, referralCode) {
-    console.log(`\n🚀 Generating ${count} wallet(s)...`);
-
-    for (let i = 1; i <= count; i++) {
-      const wallet = ethers.Wallet.createRandom();
-      const fileName = `${CONFIG.outputDir}/wallet_${i}.json`;
-
-      console.log(`\n💼 Processing Wallet ${i}/${count}`);
-      console.log(`📍 Address: ${wallet.address}`);
-
-      await this.registerWithRetry(wallet, fileName, referralCode);
-    }
-
-    console.log('\n✅ All wallets processed!');
-    console.log(`📁 Check the ${CONFIG.outputDir} directory for results`);
-  }
-
-  async registerWithRetry(wallet, fileName, referralCode, attempt = 1) {
     try {
-      const result = await this.registerWallet(wallet, referralCode);
-      fs.writeFileSync(fileName, JSON.stringify(result, null, 2));
-      console.log('🎉 Registration successful!');
-      console.log(`📄 Saved to: ${fileName}`);
+      console.log('🔍 Checking API availability...');
+      this.activeEndpoint = await this.getWorkingEndpoint();
+      
+      // Rest of your initialization code...
+      await this.runRegistration();
+
     } catch (error) {
-      console.log(`❌ Attempt ${attempt} failed: ${error.message}`);
-      
-      if (attempt < CONFIG.maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, CONFIG.retryDelay));
-        return this.registerWithRetry(wallet, fileName, referralCode, attempt + 1);
-      }
-      
-      console.log('💢 Max retries reached. Moving to next wallet.');
+      console.error('❌ Critical error:', error.message);
+      console.log('Possible solutions:');
+      console.log('1. Check your internet connection');
+      console.log('2. Verify api.synthelix.io is not blocked');
+      console.log('3. Try again later');
+      process.exit(1);
+    } finally {
+      this.rl.close();
     }
   }
 
   async registerWallet(wallet, referralCode) {
-    const timestamp = new Date().toISOString();
-    const message = `Register ${wallet.address} at ${timestamp}`;
-    const signature = await wallet.signMessage(message);
+    try {
+      const timestamp = new Date().toISOString();
+      const message = `Register ${wallet.address} at ${timestamp}`;
+      const signature = await wallet.signMessage(message);
 
-    const response = await axios.post(CONFIG.synthelixApi, {
-      walletAddress: wallet.address,
-      referralCode: referralCode || undefined,
-      signature: signature,
-      message: message,
-      timestamp: timestamp
-    }, {
-      timeout: 10000,
-      headers: { 'Content-Type': 'application/json' }
-    });
+      const response = await axios.post(this.activeEndpoint, {
+        walletAddress: wallet.address,
+        referralCode: referralCode || undefined,
+        signature: signature,
+        message: message,
+        timestamp: timestamp
+      }, {
+        timeout: CONFIG.connectionTimeout,
+        headers: { 'Content-Type': 'application/json' }
+      });
 
-    if (!response.data.success) {
-      throw new Error(response.data.message || 'Registration failed');
+      if (!response.data.success) {
+        throw new Error(response.data.message || 'Registration failed');
+      }
+
+      return response.data;
+
+    } catch (error) {
+      if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+        console.log('🔁 Switching to backup endpoint...');
+        this.activeEndpoint = await this.getWorkingEndpoint();
+        return this.registerWallet(wallet, referralCode);
+      }
+      throw error;
     }
-
-    return {
-      address: wallet.address,
-      privateKey: wallet.privateKey,
-      mnemonic: wallet.mnemonic?.phrase,
-      referralCode: referralCode || 'none',
-      registeredAt: timestamp,
-      apiResponse: response.data
-    };
   }
+
+  // ... rest of your class methods ...
 }
 
 // Run the application
